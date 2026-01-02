@@ -1,7 +1,7 @@
 import logging
 from abc import abstractmethod
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Callable, Sequence, Tuple
 
 import tinker
 from tinker_cookbook import renderers
@@ -52,6 +52,17 @@ class ProblemEnv(Env):
         """Return the reference answer for logging purposes."""
         pass
 
+    def answer_reward(self, sample_str: str) -> Tuple[float, float]:
+        """Return (reward, correctness_metric) for the answer text.
+
+        The default implementation mirrors the legacy behavior where the reward is
+        binary. Environments can override this to provide shaped rewards while
+        still emitting a binary correctness metric for logging.
+        """
+
+        correct_answer = float(self.check_answer(sample_str))
+        return correct_answer, correct_answer
+
     async def initial_observation(self) -> tuple[Observation, StopCondition]:
         convo = self.convo_prefix + [
             {"role": "user", "content": self.get_question()},
@@ -62,15 +73,15 @@ class ProblemEnv(Env):
         message, parse_success = self.renderer.parse_response(action)
         content = renderers.get_text_content(message)
         correct_format = float(parse_success) and float(self.check_format(content))
-        correct_answer = float(self.check_answer(content))
-        total_reward = self.format_coef * (correct_format - 1) + correct_answer
+        answer_reward, correctness_metric = self.answer_reward(content)
+        total_reward = self.format_coef * (correct_format - 1) + answer_reward
 
         # Log the attempt
         logtree.log_text(f"Problem: {self.get_question()}")
         logtree.log_text(f"Response: {message['content']}")
         logtree.log_text(f"Reference Answer: {self.get_reference_answer()}")
         logtree.log_text(
-            f"Format Valid: {'✓' if correct_format else '✗'}, Correct: {'✓' if correct_answer else '✗'}, Reward: {total_reward:.2f}"
+            f"Format Valid: {'✓' if correct_format else '✗'}, Correct: {'✓' if correctness_metric else '✗'}, Reward: {total_reward:.2f}"
         )
 
         return StepResult(
@@ -80,7 +91,7 @@ class ProblemEnv(Env):
             next_stop_condition=self.stop_condition,
             metrics={
                 "format": correct_format,
-                "correct": correct_answer,
+                "correct": correctness_metric,
             },
         )
 
