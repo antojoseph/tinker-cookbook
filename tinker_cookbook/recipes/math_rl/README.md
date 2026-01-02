@@ -2,6 +2,146 @@
 
 Math problems have been the most active testbed for RL with LLMs. This recipe collects environments and grading functions that allow you to test on several popular math datasets.
 
+---
+
+## Quick Start: Multiplication RL (Recommended First Example)
+
+**This is the "Hello World" of RL training.** Multi-digit multiplication is a task where LLMs genuinely struggle, making it perfect for observing real learning improvement.
+
+### Why Multiplication?
+
+| Task | Base Model Accuracy | Why It's Good for Learning |
+|------|--------------------|-----------------------------|
+| Addition (1+2) | ~100% | Too easy - model already knows it |
+| **Multiplication (3×3 digit)** | **~10-20%** | **Perfect - room to improve** |
+| Complex math (MATH dataset) | ~30-50% | Good but slower to see improvement |
+
+### Results: Before vs After Training
+
+We trained `Qwen/Qwen3-4B-Instruct-2507` for 100 batches (~$2.50) on 3-digit multiplication:
+
+| Metric | Base Model | After 100 Batches | Improvement |
+|--------|------------|-------------------|-------------|
+| **Accuracy** | 10% | 60% | **+50%** |
+| **Format** | Verbose explanations | Direct answers | Learned format |
+
+**Base model output:**
+```
+Q: What is 754 × 214?
+A: To calculate $ 754 \times 214 $, we can break it down...
+```
+
+**Trained model output:**
+```
+Q: What is 754 × 214?
+A: 161356
+```
+
+### Run It Yourself
+
+```bash
+# Quick test (~$0.50) - verify everything works
+python -m tinker_cookbook.recipes.math_rl.train_multiplication \
+    model_name=Qwen/Qwen3-4B-Instruct-2507 \
+    n_batches=10 \
+    batch_size=20 \
+    difficulty=easy
+
+# Medium run with W&B logging (~$2.50)
+python -m tinker_cookbook.recipes.math_rl.train_multiplication \
+    model_name=Qwen/Qwen3-4B-Instruct-2507 \
+    n_batches=100 \
+    batch_size=50 \
+    difficulty=medium \
+    wandb_project=multiplication-rl
+
+# Full training (~$15)
+python -m tinker_cookbook.recipes.math_rl.train_multiplication \
+    model_name=meta-llama/Llama-3.1-8B-Instruct \
+    n_batches=200 \
+    batch_size=50 \
+    difficulty=medium \
+    wandb_project=multiplication-rl
+```
+
+### Difficulty Levels
+
+| Level | Range | Example | Base Accuracy |
+|-------|-------|---------|---------------|
+| `easy` | 2-digit × 2-digit | 47 × 83 | ~70% |
+| `medium` | 3-digit × 3-digit | 847 × 293 | ~20% |
+| `hard` | 4-digit × 4-digit | 4821 × 7293 | ~5% |
+
+### Test Your Trained Model
+
+After training, test your model with this script:
+
+```python
+import asyncio
+import json
+import re
+import tinker
+from tinker_cookbook import renderers, model_info
+from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+async def test_model(checkpoint_path: str, model_name: str = "Qwen/Qwen3-4B-Instruct-2507"):
+    # Load checkpoint
+    with open(checkpoint_path) as f:
+        last_ckpt = json.loads(f.readlines()[-1].strip())
+
+    # Setup
+    tokenizer = get_tokenizer(model_name)
+    renderer = renderers.get_renderer(
+        model_info.get_recommended_renderer_name(model_name), tokenizer
+    )
+
+    # Create sampling client with trained weights
+    service_client = tinker.ServiceClient()
+    sampling_client = service_client.create_sampling_client(
+        base_model=model_name,
+        model_path=last_ckpt['sampler_path'],
+    )
+
+    # Test a problem
+    messages = [
+        {"role": "user", "content": "What is 12 × 15?"},
+        {"role": "assistant", "content": "180"},
+        {"role": "user", "content": "What is 847 × 293?"},
+    ]
+
+    model_input = renderer.build_generation_prompt(messages)
+    result = await sampling_client.sample_async(
+        prompt=model_input,
+        num_samples=1,
+        sampling_params=tinker.SamplingParams(
+            max_tokens=32, temperature=0.0,
+            stop=renderer.get_stop_sequences(),
+        ),
+    )
+
+    parsed, _ = renderer.parse_response(result.sequences[0].tokens)
+    print(f"847 × 293 = {847 * 293}")
+    print(f"Model answer: {parsed['content']}")
+
+# Run: asyncio.run(test_model("/tmp/tinker-examples/multiplication/.../checkpoints.jsonl"))
+```
+
+### How It Works
+
+1. **Environment** (`multiplication_env.py`): Generates random multiplication problems
+2. **Reward**: Binary - 1.0 if correct answer found in response, 0.0 otherwise
+3. **Algorithm**: GRPO (Group Relative Policy Optimization)
+4. **Few-shot prompting**: Two examples shown to establish format
+
+### Cost Estimates
+
+| Configuration | Batches | Est. Cost |
+|--------------|---------|-----------|
+| Quick test | 10 | ~$0.50 |
+| See improvement | 100 | ~$2.50 |
+| Full training | 200 | ~$5.00 |
+
+---
 
 ## RL on arithmetic.
 

@@ -8,6 +8,31 @@ We provide two libraries for the broader community to customize their language m
 - `tinker` is a training SDK for researchers and developers to fine-tune language models. You send API requests to us and we handle the complexities of distributed training.
 - `tinker-cookbook` includes realistic examples of fine-tuning language models. It builds on the Tinker API and provides common abstractions to fine-tune language models.
 
+## Quick Start: See RL Learning in Action
+
+**New to RL fine-tuning?** Start with our multiplication example - train a model to multiply 3-digit numbers and watch accuracy improve from 10% to 60% in minutes:
+
+```bash
+# Install and set your API key
+export TINKER_API_KEY=your-key
+
+# Run multiplication RL training (~$2.50, ~15 minutes)
+python -m tinker_cookbook.recipes.math_rl.train_multiplication \
+    model_name=Qwen/Qwen3-4B-Instruct-2507 \
+    n_batches=100 \
+    batch_size=50 \
+    difficulty=medium
+```
+
+| Before Training | After 100 Batches |
+|----------------|-------------------|
+| 10% accuracy | **60% accuracy** |
+| Verbose explanations | Direct answers |
+
+See the full guide with results and testing instructions: **[Multiplication RL Tutorial](tinker_cookbook/recipes/math_rl/README.md#quick-start-multiplication-rl-recommended-first-example)**
+
+---
+
 ## Installation
 
 1. Sign up for Tinker [here](https://auth.thinkingmachines.ai/sign-up).
