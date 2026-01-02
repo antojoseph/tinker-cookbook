@@ -4,15 +4,15 @@ Multiplication RL Environment
 Train a model to multiply 3-digit numbers - something LLMs actually struggle with!
 
 Example:
-    "What is 847 × 293?" → "248171"
+    "What is 847 * 293?" → "248171"
 
 This is a task where RL can genuinely improve model capabilities,
 unlike simple addition which models already know.
 """
 
-from functools import partial
-from typing import Sequence, Literal
 import re
+from functools import partial
+from typing import Literal, Sequence
 
 import chz
 import numpy as np
@@ -42,36 +42,51 @@ class MultiplicationEnv(ProblemEnv):
         self.y = y
 
     def get_question(self) -> str:
-        return f"What is {self.x} × {self.y}?"
+        return f"What is {self.x} * {self.y}? Answer with only the integer."
+
+    def _extract_candidate_int(self, sample_str: str) -> int | None:
+        cleaned = sample_str.replace(",", "")
+        numbers = re.findall(r"-?\d+", cleaned)
+        if not numbers:
+            return None
+        try:
+            return int(numbers[-1])
+        except ValueError:
+            return None
 
     def check_answer(self, sample_str: str) -> bool:
-        # Try to extract a number from the response
-        # Handle various formats: "248171", "The answer is 248171", "248,171", etc.
+        candidate = self._extract_candidate_int(sample_str)
+        return candidate == self.x * self.y
 
-        # Remove commas from numbers (e.g., "248,171" -> "248171")
-        cleaned = sample_str.replace(",", "")
+    def answer_reward(self, sample_str: str) -> tuple[float, float]:
+        """Reward correct suffix digits to provide dense feedback."""
 
-        # Find all numbers in the response
-        numbers = re.findall(r'-?\d+', cleaned)
+        correct_value = self.x * self.y
+        candidate = self._extract_candidate_int(sample_str)
+        if candidate is None:
+            return 0.0, 0.0
 
-        if not numbers:
-            return False
+        if candidate == correct_value:
+            return 1.0, 1.0
 
-        # Check if any number matches the correct answer
-        correct = self.x * self.y
-        for num_str in numbers:
-            try:
-                if int(num_str) == correct:
-                    return True
-            except ValueError:
-                continue
+        correct_str = str(correct_value)
+        candidate_str = str(abs(candidate))
 
-        return False
+        score = 0.0
+        for k in range(1, min(len(correct_str), len(candidate_str)) + 1):
+            if candidate_str[-k:] == correct_str[-k:]:
+                score += 0.2
+            else:
+                break
+
+        return min(score, 0.8), 0.0
 
     def check_format(self, sample_str: str) -> bool:
-        # Accept any response that contains a number
-        cleaned = sample_str.replace(",", "")
-        return bool(re.search(r'\d+', cleaned))
+        stripped = sample_str.strip()
+        # Optional "The answer is" prefix, followed by a single integer (allow commas)
+        return bool(
+            re.fullmatch(r"(?:The answer is\s*)?-?\d{1,3}(?:,\d{3})*|(?:-?\d+)", stripped)
+        )
 
     def get_reference_answer(self) -> str:
         return str(self.x * self.y)
@@ -80,9 +95,9 @@ class MultiplicationEnv(ProblemEnv):
     def standard_fewshot_prefix() -> list[renderers.Message]:
         """Provide a few-shot example to show the expected format."""
         return [
-            {"role": "user", "content": "What is 12 × 15?"},
+            {"role": "user", "content": "What is 12 * 15?"},
             {"role": "assistant", "content": "180"},
-            {"role": "user", "content": "What is 34 × 27?"},
+            {"role": "user", "content": "What is 34 * 27?"},
             {"role": "assistant", "content": "918"},
         ]
 
