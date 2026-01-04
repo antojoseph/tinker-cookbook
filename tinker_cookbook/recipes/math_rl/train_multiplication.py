@@ -62,7 +62,7 @@ class CLIConfig:
     # Model configuration
     # Recommended: Qwen/Qwen3-4B-Instruct-2507 (cheap), meta-llama/Llama-3.1-8B-Instruct (balanced)
     model_name: str = "Qwen/Qwen3-4B-Instruct-2507"
-    lora_rank: int = 32
+    lora_rank: int = 16         # Reduced from 32 for RL stability
     renderer_name: str | None = None
     load_checkpoint_path: str | None = None
 
@@ -70,7 +70,8 @@ class CLIConfig:
     batch_size: int = 50        # Problems per batch
     group_size: int = 4         # Samples per problem (for GRPO variance)
     n_batches: int = 100        # Total training batches
-    learning_rate: float = 1e-4
+    learning_rate: float = 3e-5 # Reduced from 1e-4 for RL stability
+    kl_penalty_coef: float = 0.01  # Small KL penalty to prevent format drift
     max_tokens: int = 64        # Short responses for math (just the number)
 
     # Task configuration
@@ -134,6 +135,7 @@ async def main(config: CLIConfig) -> None:
         learning_rate=config.learning_rate,
         max_tokens=config.max_tokens,
         lora_rank=config.lora_rank,
+        kl_penalty_coef=config.kl_penalty_coef,
         eval_every=config.eval_every,
         save_every=config.save_every,
         wandb_project=config.wandb_project,
@@ -164,6 +166,8 @@ async def main(config: CLIConfig) -> None:
     print("=" * 60)
     print(f"Model:        {config.model_name}")
     print(f"LoRA rank:    {config.lora_rank}")
+    print(f"Learning rate: {config.learning_rate}")
+    print(f"KL penalty:   {config.kl_penalty_coef}")
     print(f"Difficulty:   {config.difficulty}")
     print(f"Batches:      {config.n_batches}")
     print(f"Batch size:   {config.batch_size} problems × {config.group_size} samples")

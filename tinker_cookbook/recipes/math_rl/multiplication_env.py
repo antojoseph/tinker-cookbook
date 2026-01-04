@@ -21,6 +21,10 @@ from tinker_cookbook.rl.problem_env import ProblemEnv, ProblemGroupBuilder
 from tinker_cookbook.rl.types import EnvGroupBuilder, RLDataset, RLDatasetBuilder
 from tinker_cookbook.tokenizer_utils import get_tokenizer
 
+# Unified regex for integer extraction and format validation
+# Matches: "248171", "The answer is 248171", "248,171", "The answer is 248,171"
+_INT_RE = re.compile(r"^\s*(?:The answer is\s*)?(-?(?:\d{1,3}(?:,\d{3})+|\d+))\s*$", re.IGNORECASE)
+
 
 class MultiplicationEnv(ProblemEnv):
     """
@@ -45,60 +49,80 @@ class MultiplicationEnv(ProblemEnv):
         return f"What is {self.x} * {self.y}? Answer with only the integer."
 
     def _extract_candidate_int(self, sample_str: str) -> int | None:
-        cleaned = sample_str.replace(",", "")
-        numbers = re.findall(r"-?\d+", cleaned)
-        if not numbers:
+        """Extract integer from response using unified regex.
+
+        Only extracts if the response matches the expected format exactly.
+        This prevents issues like "Confidence: 0.9" extracting 9.
+        """
+        m = _INT_RE.fullmatch(sample_str.strip())
+        if not m:
             return None
-        try:
-            return int(numbers[-1])
-        except ValueError:
-            return None
+        return int(m.group(1).replace(",", ""))
 
     def check_answer(self, sample_str: str) -> bool:
         candidate = self._extract_candidate_int(sample_str)
         return candidate == self.x * self.y
 
     def answer_reward(self, sample_str: str) -> tuple[float, float]:
-        """Reward correct suffix digits to provide dense feedback."""
+        """Reward correct suffix digits to provide dense feedback.
 
+        Returns (shaped_reward, correctness_metric):
+        - Perfect answer: (1.0, 1.0)
+        - Partial match: (0.0 to 0.95, 0.0) - smooth scaling by suffix match
+        - No match / invalid: (0.0, 0.0)
+        """
         correct_value = self.x * self.y
         candidate = self._extract_candidate_int(sample_str)
         if candidate is None:
+            return 0.0, 0.0
+
+        # Reject negative numbers (impossible for positive inputs x, y)
+        if candidate < 0:
             return 0.0, 0.0
 
         if candidate == correct_value:
             return 1.0, 1.0
 
         correct_str = str(correct_value)
-        candidate_str = str(abs(candidate))
+        candidate_str = str(candidate)
 
-        score = 0.0
-        for k in range(1, min(len(correct_str), len(candidate_str)) + 1):
-            if candidate_str[-k:] == correct_str[-k:]:
-                score += 0.2
+        # Count contiguous matching suffix digits
+        k = 0
+        for i in range(1, min(len(correct_str), len(candidate_str)) + 1):
+            if candidate_str[-i:] == correct_str[-i:]:
+                k = i
             else:
                 break
 
-        return min(score, 0.8), 0.0
+        # Smooth reward up to 0.95 (leaves gap for perfect answer)
+        # This removes the old 0.8 cap that prevented signal for 5th/6th digits
+        dense = 0.95 * (k / len(correct_str))
+        return dense, 0.0
 
     def check_format(self, sample_str: str) -> bool:
-        stripped = sample_str.strip()
-        # Optional "The answer is" prefix, followed by a single integer (allow commas)
-        return bool(
-            re.fullmatch(r"(?:The answer is\s*)?-?\d{1,3}(?:,\d{3})*|(?:-?\d+)", stripped)
-        )
+        """Check if response matches expected integer format.
+
+        Uses same regex as extraction for consistency.
+        Accepts: "248171", "The answer is 248171", "248,171", etc.
+        """
+        return _INT_RE.fullmatch(sample_str.strip()) is not None
 
     def get_reference_answer(self) -> str:
         return str(self.x * self.y)
 
     @staticmethod
     def standard_fewshot_prefix() -> list[renderers.Message]:
-        """Provide a few-shot example to show the expected format."""
+        """Provide few-shot examples to show the expected format.
+
+        Includes 2-digit and 3-digit examples to cover easy/medium difficulties.
+        """
         return [
             {"role": "user", "content": "What is 12 * 15?"},
             {"role": "assistant", "content": "180"},
             {"role": "user", "content": "What is 34 * 27?"},
             {"role": "assistant", "content": "918"},
+            {"role": "user", "content": "What is 847 * 293?"},
+            {"role": "assistant", "content": "248171"},
         ]
 
 
