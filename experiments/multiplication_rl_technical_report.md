@@ -54,45 +54,38 @@ We used **Reinforcement Learning from Verifiable Rewards (RLVR)** where the rewa
 
 Tinker operates on a split-responsibility architecture:
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         CLIENT SIDE (Python)                        │
-├─────────────────────────────────────────────────────────────────────┤
-│  • Data preparation & tokenization                                  │
-│  • Environment logic & reward computation                           │
-│  • Advantage calculation (GRPO centering)                           │
-│  • Trajectory assembly                                              │
-│  • Metric aggregation & logging                                     │
-│  • Checkpoint management                                            │
-└───────────────────────────────┬─────────────────────────────────────┘
-                                │ HTTPS/gRPC
-                                ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│                    SERVER SIDE (Tinker Service)                     │
-├─────────────────────────────────────────────────────────────────────┤
-│  • GPU worker pool management                                       │
-│  • Forward passes (inference & logprob computation)                 │
-│  • Backward passes (gradient computation)                           │
-│  • Optimizer steps (Adam updates)                                   │
-│  • LoRA weight management                                           │
-│  • Multi-tenant scheduling                                          │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**CLIENT SIDE (Python):**
+- Data preparation & tokenization
+- Environment logic & reward computation
+- Advantage calculation (GRPO centering)
+- Trajectory assembly
+- Metric aggregation & logging
+- Checkpoint management
+
+**SERVER SIDE (Tinker Service):** *(communicates via HTTPS/gRPC)*
+- GPU worker pool management
+- Forward passes (inference & logprob computation)
+- Backward passes (gradient computation)
+- Optimizer steps (Adam updates)
+- LoRA weight management
+- Multi-tenant scheduling
 
 ### 2.2 Clock Cycle Synchronization
 
 Tinker's GPU workers operate in **lock-step clock cycles**. Each cycle can execute one forward-backward pass and one optimizer step. Efficient training requires pipelining requests:
 
+**Naive approach (3 clock cycles):**
 ```
-Naive (3 clock cycles):
-  Cycle 1: forward_backward() ─────► wait
-  Cycle 2: optim_step() ───────────► wait
-  Cycle 3: forward_backward() ─────► wait
+Cycle 1: forward_backward() → wait
+Cycle 2: optim_step() → wait
+Cycle 3: forward_backward() → wait
+```
 
-Optimized (1 clock cycle per step):
-  Submit: forward_backward_async() ──┐
-  Submit: optim_step_async() ────────┼── Both land on same cycle
-  Await:  results ───────────────────┘
+**Optimized approach (1 clock cycle per step):**
+```
+Submit: forward_backward_async() ─┐
+Submit: optim_step_async() ───────┼── Both land on same cycle
+Await:  results ──────────────────┘
 ```
 
 **Implementation Pattern:**
@@ -108,18 +101,13 @@ optim_result = await optim_future.result_async()
 
 ### 2.3 Training and Sampling Clients
 
-```
-┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
-│  ServiceClient   │────►│ TrainingClient   │────►│ SamplingClient   │
-│                  │     │                  │     │                  │
-│ • create_lora_   │     │ • forward_       │     │ • sample_async() │
-│   training_      │     │   backward_async │     │ • get_tokenizer  │
-│   client_async   │     │ • optim_step_    │     │                  │
-│ • create_        │     │   async          │     │                  │
-│   sampling_      │     │ • save_weights   │     │                  │
-│   client         │     │                  │     │                  │
-└──────────────────┘     └──────────────────┘     └──────────────────┘
-```
+**ServiceClient** → creates → **TrainingClient** → saves weights for → **SamplingClient**
+
+| Client | Key Methods |
+|--------|-------------|
+| ServiceClient | `create_lora_training_client_async`, `create_sampling_client` |
+| TrainingClient | `forward_backward_async`, `optim_step_async`, `save_weights` |
+| SamplingClient | `sample_async`, `get_tokenizer` |
 
 **Critical:** After each weight update, a **new SamplingClient** must be created to ensure logprobs are computed against the current policy, not a stale one.
 
@@ -131,24 +119,22 @@ optim_result = await optim_future.result_async()
 
 GRPO is a variance reduction technique that centers advantages within groups of rollouts from the same problem:
 
-```
-Problem P₁: Generate G=4 rollouts
-  ┌─────────────────────────────────────────────────────┐
-  │ Rollout 1: "248171" → R₁ = 1.0 (correct)           │
-  │ Rollout 2: "248170" → R₂ = 0.32 (partial)          │
-  │ Rollout 3: "200000" → R₃ = 0.0 (wrong)             │
-  │ Rollout 4: "248171" → R₄ = 1.0 (correct)           │
-  │                                                     │
-  │ Mean reward: R̄ = (1.0 + 0.32 + 0.0 + 1.0) / 4     │
-  │            = 0.58                                   │
-  │                                                     │
-  │ Centered advantages:                                │
-  │   A₁ = 1.0 - 0.58 = +0.42  (reinforce)             │
-  │   A₂ = 0.32 - 0.58 = -0.26 (discourage)            │
-  │   A₃ = 0.0 - 0.58 = -0.58  (strongly discourage)   │
-  │   A₄ = 1.0 - 0.58 = +0.42  (reinforce)             │
-  └─────────────────────────────────────────────────────┘
-```
+**Example: Problem P₁ with G=4 rollouts**
+
+| Rollout | Response | Reward |
+|---------|----------|--------|
+| 1 | "248171" | R₁ = 1.0 (correct) |
+| 2 | "248170" | R₂ = 0.32 (partial) |
+| 3 | "200000" | R₃ = 0.0 (wrong) |
+| 4 | "248171" | R₄ = 1.0 (correct) |
+
+**Mean reward:** R̄ = (1.0 + 0.32 + 0.0 + 1.0) / 4 = 0.58
+
+**Centered advantages:**
+- A₁ = 1.0 - 0.58 = +0.42 (reinforce)
+- A₂ = 0.32 - 0.58 = -0.26 (discourage)
+- A₃ = 0.0 - 0.58 = -0.58 (strongly discourage)
+- A₄ = 1.0 - 0.58 = +0.42 (reinforce)
 
 **Why GRPO works:**
 - Compares each rollout to the group mean, not a learned baseline
@@ -192,33 +178,25 @@ Where:
 
 ### 3.4 Training Loop Flow
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                     TRAINING LOOP (per batch)                       │
-└─────────────────────────────────────────────────────────────────────┘
-                                │
-        ┌───────────────────────┼───────────────────────┐
-        ▼                       ▼                       ▼
-┌───────────────┐      ┌───────────────┐      ┌───────────────┐
-│   SAMPLING    │      │   TRAINING    │      │   LOGGING     │
-├───────────────┤      ├───────────────┤      ├───────────────┤
-│ 1. Get batch  │      │ 1. Compute    │      │ 1. Aggregate  │
-│    of problems│      │    advantages │      │    metrics    │
-│               │      │    (GRPO)     │      │               │
-│ 2. For each   │      │               │      │ 2. Log to     │
-│    problem:   │      │ 2. Assemble   │      │    W&B        │
-│    - Generate │      │    training   │      │               │
-│      G=4      │      │    datums     │      │ 3. Save       │
-│      rollouts │      │               │      │    checkpoint │
-│               │      │ 3. Apply KL   │      │               │
-│ 3. Compute    │      │    penalty    │      │ 4. Create new │
-│    rewards    │      │               │      │    sampler    │
-│               │      │ 4. forward_   │      │               │
-│               │      │    backward   │      │               │
-│               │      │               │      │               │
-│               │      │ 5. optim_step │      │               │
-└───────────────┘      └───────────────┘      └───────────────┘
-```
+**Per-batch training loop:**
+
+1. **SAMPLING**
+   - Get batch of problems
+   - For each problem, generate G=4 rollouts
+   - Compute rewards
+
+2. **TRAINING**
+   - Compute advantages (GRPO)
+   - Assemble training datums
+   - Apply KL penalty
+   - forward_backward
+   - optim_step
+
+3. **LOGGING**
+   - Aggregate metrics
+   - Log to W&B
+   - Save checkpoint
+   - Create new sampler
 
 ---
 
@@ -228,65 +206,51 @@ Where:
 
 The `MultiplicationEnv` class implements the Tinker `Env` interface:
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                      MultiplicationEnv                              │
-├─────────────────────────────────────────────────────────────────────┤
-│ State:                                                              │
-│   x: int          # First multiplicand (100-999 for medium)        │
-│   y: int          # Second multiplicand                             │
-│   renderer        # Tokenizer wrapper                               │
-│   convo_prefix    # Few-shot examples                               │
-│                                                                     │
-│ Methods:                                                            │
-│   get_question() → "What is {x} * {y}? Answer with only the int."  │
-│   check_format(response) → bool                                     │
-│   check_answer(response) → bool                                     │
-│   answer_reward(response) → (shaped_reward, correctness_metric)     │
-│   get_reference_answer() → str(x * y)                               │
-└─────────────────────────────────────────────────────────────────────┘
-```
+**State:**
+- `x: int` — First multiplicand (100-999 for medium)
+- `y: int` — Second multiplicand
+- `renderer` — Tokenizer wrapper
+- `convo_prefix` — Few-shot examples
+
+**Methods:**
+- `get_question()` → "What is {x} * {y}? Answer with only the int."
+- `check_format(response)` → bool
+- `check_answer(response)` → bool
+- `answer_reward(response)` → (shaped_reward, correctness_metric)
+- `get_reference_answer()` → str(x * y)
 
 ### 4.2 Episode Structure
 
 Each multiplication problem is a **single-turn episode**:
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     EPISODE FLOW                              │
-└──────────────────────────────────────────────────────────────┘
+**Step 1: initial_observation()**
 
-1. initial_observation()
-   ┌─────────────────────────────────────────────────────────┐
-   │ <|im_start|>user                                        │
-   │ What is 12 * 15?<|im_end|>                              │
-   │ <|im_start|>assistant                                   │
-   │ 180<|im_end|>                                           │
-   │ <|im_start|>user                                        │
-   │ What is 34 * 27?<|im_end|>                              │
-   │ <|im_start|>assistant                                   │
-   │ 918<|im_end|>                                           │
-   │ <|im_start|>user                                        │
-   │ What is 847 * 293?<|im_end|>      ← 3-digit example     │
-   │ <|im_start|>assistant                                   │
-   │ 248171<|im_end|>                                        │
-   │ <|im_start|>user                                        │
-   │ What is 523 * 847?<|im_end|>      ← actual problem      │
-   │ <|im_start|>assistant                                   │
-   └─────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-2. Model generates response (e.g., "442981")
-                            │
-                            ▼
-3. env.step(response)
-   ┌─────────────────────────────────────────────────────────┐
-   │ • Parse response                                        │
-   │ • Check format validity                                 │
-   │ • Compute shaped reward                                 │
-   │ • Return StepResult(reward, episode_done=True)          │
-   └─────────────────────────────────────────────────────────┘
+The prompt includes few-shot examples followed by the actual problem:
 ```
+<|im_start|>user
+What is 12 * 15?<|im_end|>
+<|im_start|>assistant
+180<|im_end|>
+<|im_start|>user
+What is 34 * 27?<|im_end|>
+<|im_start|>assistant
+918<|im_end|>
+<|im_start|>user
+What is 847 * 293?<|im_end|>      ← 3-digit example
+<|im_start|>assistant
+248171<|im_end|>
+<|im_start|>user
+What is 523 * 847?<|im_end|>      ← actual problem
+<|im_start|>assistant
+```
+
+**Step 2:** Model generates response (e.g., "442981")
+
+**Step 3: env.step(response)**
+- Parse response
+- Check format validity
+- Compute shaped reward
+- Return StepResult(reward, episode_done=True)
 
 ### 4.3 Format Validation
 
@@ -321,39 +285,31 @@ _INT_RE = re.compile(
 
 The `answer_reward()` method returns a tuple: `(shaped_reward, correctness_metric)`:
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                    REWARD COMPUTATION FLOW                          │
-└─────────────────────────────────────────────────────────────────────┘
+**Reward Computation Flow:**
 
-Input: response = "248170"
-Correct answer = 248171
+Input: response = "248170", Correct answer = 248171
 
-1. Extract candidate integer
-   └── candidate = 248170 ✓
+1. **Extract candidate integer** → candidate = 248170 ✓
+2. **Check for exact match** → 248170 ≠ 248171, continue to partial credit
+3. **Count matching suffix digits:**
+   ```
+   Correct:   2 4 8 1 7 1
+   Candidate: 2 4 8 1 7 0
+                        ↑
+              Last digit differs
 
-2. Check for exact match
-   └── 248170 ≠ 248171, continue to partial credit
+   Match from right:
+     Position 1: 1 ≠ 0  → stop
+     k = 0 matching digits
+   ```
+4. **Compute shaped reward:**
+   ```
+   dense = 0.95 * (k / len("248171"))
+        = 0.95 * (0 / 6)
+        = 0.0
+   ```
 
-3. Count matching suffix digits
-   ┌─────────────────────────────────────────┐
-   │ Correct:   2 4 8 1 7 1                  │
-   │ Candidate: 2 4 8 1 7 0                  │
-   │                      ↑                  │
-   │            Last digit differs           │
-   │                                         │
-   │ Match from right:                       │
-   │   Position 1: 1 ≠ 0  → stop             │
-   │   k = 0 matching digits                 │
-   └─────────────────────────────────────────┘
-
-4. Compute shaped reward
-   └── dense = 0.95 * (k / len("248171"))
-            = 0.95 * (0 / 6)
-            = 0.0
-
-Return: (0.0, 0.0)
-```
+**Return:** (0.0, 0.0)
 
 ### 5.2 Reward Examples
 
@@ -380,25 +336,23 @@ The suffix matching heuristic aligns with how multiplication errors typically pr
  1694     (847 × 2, shifted)
 ─────────
  248171   ← errors in early partial products affect leftmost digits
-
-Common error pattern:
-  If you miscalculate 847 × 2 = 1694 as 1684,
-  the result becomes 247171 (wrong in position 6, but 5 suffix digits correct)
 ```
+
+**Common error pattern:** If you miscalculate 847 × 2 = 1694 as 1684, the result becomes 247171 (wrong in position 6, but 5 suffix digits correct)
 
 This reward structure encourages the model to get the rightmost digits correct first, which is a natural learning progression.
 
 ### 5.4 Improvements from ML Researcher Feedback
 
 **Original Implementation Issues:**
-1. **0.8 cap on shaped reward** - Limited signal for 5th/6th digit progress
-2. **Cumulative scoring** - Added 0.2 per matching digit (non-linear)
-3. **"Last number wins" extraction** - Could grab wrong number from verbose responses
+1. **0.8 cap on shaped reward** — Limited signal for 5th/6th digit progress
+2. **Cumulative scoring** — Added 0.2 per matching digit (non-linear)
+3. **"Last number wins" extraction** — Could grab wrong number from verbose responses
 
 **Fixed Implementation:**
-1. **0.95 cap** - Leaves clear gap for perfect answers while allowing full progression
-2. **Linear scaling** - `0.95 * (k / total_digits)` provides smooth gradient
-3. **fullmatch regex** - Ensures entire response matches expected format
+1. **0.95 cap** — Leaves clear gap for perfect answers while allowing full progression
+2. **Linear scaling** — `0.95 * (k / total_digits)` provides smooth gradient
+3. **fullmatch regex** — Ensures entire response matches expected format
 
 ---
 
@@ -450,20 +404,14 @@ eval_every = 0              # Inline metrics only
 
 ### 6.3 Cost Estimation
 
-```
-Tokens per batch:
-  50 problems × 4 rollouts × 150 tokens/rollout = 30,000 tokens
-
-Total training tokens:
-  30,000 × 100 batches = 3,000,000 tokens
-
-Cost (Qwen3-4B):
-  Prefill: $0.22/M tokens
-  Sample:  $0.22/M tokens
-  Train:   $0.07/M tokens
-  ─────────────────────────
-  Total:   $0.51/M tokens × 3M ≈ $1.50
-```
+| Item | Calculation |
+|------|-------------|
+| Tokens per batch | 50 problems × 4 rollouts × 150 tokens/rollout = 30,000 tokens |
+| Total training tokens | 30,000 × 100 batches = 3,000,000 tokens |
+| Prefill cost | $0.22/M tokens |
+| Sample cost | $0.22/M tokens |
+| Train cost | $0.07/M tokens |
+| **Total** | $0.51/M tokens × 3M ≈ **$1.50** |
 
 ---
 
@@ -471,44 +419,31 @@ Cost (Qwen3-4B):
 
 ### 7.1 Training Metrics Over Time
 
-```
-Accuracy by 10-batch windows:
+**Accuracy by 10-batch windows:**
 
-     50% ┤
-         │                           ●
-     45% ┤                          ╱ ╲
-         │                         ╱   ╲
-     40% ┤        ●───●───●───●───●     ●───●
-         │       ╱                           ╲
-     35% ┤  ●───●                             ●
-         │
-     30% ┤
-         └────┬────┬────┬────┬────┬────┬────┬──
-              10   20   30   40   50   60   70  80   90  100
-                              Batch
+| Batch Range | Accuracy |
+|-------------|----------|
+| 1-10 | ~35% |
+| 10-20 | ~35% |
+| 20-30 | ~40% |
+| 30-40 | ~40% |
+| 40-50 | ~40% |
+| 50-60 | ~40% |
+| 60-70 | ~45% |
+| **70-80** | **~49% (peak)** |
+| 80-90 | ~40% |
+| 90-100 | ~35% |
 
-Legend: ● = 10-batch window average
-Peak: 49% at batch 70
-Best window: 41.9% (batches 69-78)
-```
+**Best window:** 41.9% (batches 69-78)
 
 ### 7.2 Format Stability Comparison
 
-```
-Previous Run (no KL penalty):          Current Run (KL penalty = 0.01):
+**Previous Run (no KL penalty):**
+- Started at 100%
+- Dropped to 73% by batch 80 (format collapse)
 
-100% ┤●●●●●●●●●●●●●●●●●                100% ┤●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●●
-     │                 ╲                    │
- 90% ┤                  ╲               90% ┤
-     │                   ╲                  │
- 80% ┤                    ╲             80% ┤
-     │                     ●──●             │
- 73% ┤                        ↑         70% ┤
-     │               Format collapse        │
-     └─────────────────────────────        └────────────────────────────────
-       0    20    40    60    80   100        0    20    40    60    80   100
-                  Batch                                   Batch
-```
+**Current Run (KL penalty = 0.01):**
+- Stable at 100% throughout all 100 batches
 
 ### 7.3 Held-Out Evaluation
 
@@ -526,20 +461,18 @@ Previous Run (no KL penalty):          Current Run (KL penalty = 0.01):
 
 ### 7.4 Learning Signal Quality
 
-```
-Group composition over training:
+**Group composition over training:**
 
-┌─────────────────────────────────────────────────────────────────────┐
-│  frac_mixed (has gradient signal):     24% → 28%  ✓ Good           │
-│  frac_all_good (no signal needed):     28% → 32%  ✓ Improving      │
-│  frac_all_bad (no signal available):   48% → 40%  ✓ Decreasing     │
-└─────────────────────────────────────────────────────────────────────┘
+| Metric | Start | End | Interpretation |
+|--------|-------|-----|----------------|
+| frac_mixed (has gradient signal) | 24% | 28% | ✓ Good |
+| frac_all_good (no signal needed) | 28% | 32% | ✓ Improving |
+| frac_all_bad (no signal available) | 48% | 40% | ✓ Decreasing |
 
-Interpretation:
+**Interpretation:**
 - frac_mixed > 25%: GRPO advantage centering is working
 - frac_all_bad decreasing: Model is learning to solve more problems
 - frac_all_good increasing: More problems fully solved
-```
 
 ### 7.5 Comparison: Before vs After ML Researcher Fixes
 
@@ -674,74 +607,53 @@ From our successful training run:
 
 ---
 
-## Appendix A: System Diagram
+## Appendix A: System Overview
 
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                        MULTIPLICATION RL SYSTEM                              │
-└─────────────────────────────────────────────────────────────────────────────┘
+**MULTIPLICATION RL SYSTEM**
 
-┌─────────────────┐     ┌─────────────────┐     ┌─────────────────────────────┐
-│  Dataset        │     │  Environment    │     │  Tinker Service             │
-│  Builder        │     │  (per problem)  │     │                             │
-├─────────────────┤     ├─────────────────┤     ├─────────────────────────────┤
-│ • difficulty    │     │ • x, y values   │     │ ┌─────────────────────────┐ │
-│ • batch_size    │────►│ • few-shot      │     │ │   Training Client       │ │
-│ • group_size    │     │   prefix        │     │ │   (LoRA adapter)        │ │
-│ • n_batches     │     │ • renderer      │     │ └───────────┬─────────────┘ │
-└─────────────────┘     └────────┬────────┘     │             │               │
-                                 │              │             ▼               │
-                                 ▼              │ ┌─────────────────────────┐ │
-┌─────────────────────────────────────────┐    │ │   GPU Worker Pool       │ │
-│           ROLLOUT PHASE                  │    │ │   • Forward pass        │ │
-├─────────────────────────────────────────┤    │ │   • Backward pass       │ │
-│                                          │    │ │   • Optimizer step      │ │
-│  for each problem P:                     │    │ └───────────┬─────────────┘ │
-│    for g in range(group_size):           │    │             │               │
-│      ┌────────────────────────────┐      │    │             ▼               │
-│      │ 1. Get observation (prompt)│      │    │ ┌─────────────────────────┐ │
-│      │ 2. Sample from policy ─────┼──────┼────┼─│   Sampling Client       │ │
-│      │ 3. Get reward from env     │      │    │ │   (inference)           │ │
-│      │ 4. Store trajectory        │      │    │ └─────────────────────────┘ │
-│      └────────────────────────────┘      │    └─────────────────────────────┘
-│                                          │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│         TRAINING PHASE                   │
-├─────────────────────────────────────────┤
-│                                          │
-│  1. Compute GRPO advantages              │
-│     A_i = R_i - mean(R_group)            │
-│                                          │
-│  2. Apply KL penalty                     │
-│     A' = A + α(log p_base - log p_curr)  │
-│                                          │
-│  3. Assemble training datums             │
-│     (tokens, logprobs, advantages)       │
-│                                          │
-│  4. Forward-backward pass ───────────────┼────► Tinker GPU
-│                                          │
-│  5. Optimizer step ──────────────────────┼────► Tinker GPU
-│                                          │
-│  6. Save checkpoint & create new sampler │
-│                                          │
-└─────────────────────────────────────────┘
-                    │
-                    ▼
-┌─────────────────────────────────────────┐
-│         LOGGING PHASE                    │
-├─────────────────────────────────────────┤
-│  • frac_correct (accuracy)               │
-│  • frac_correct_format                   │
-│  • frac_mixed / frac_all_good / all_bad  │
-│  • kl_policy_base                        │
-│  • reward/total                          │
-│                                          │
-│  Output: W&B dashboard, metrics.jsonl    │
-└─────────────────────────────────────────┘
-```
+### Dataset Builder
+- difficulty
+- batch_size
+- group_size
+- n_batches
+
+### Environment (per problem)
+- x, y values
+- few-shot prefix
+- renderer
+
+### Tinker Service
+- Training Client (LoRA adapter)
+- GPU Worker Pool (forward/backward/optimizer)
+- Sampling Client (inference)
+
+### Rollout Phase
+
+For each problem P, for g in range(group_size):
+1. Get observation (prompt)
+2. Sample from policy (via Tinker Sampling Client)
+3. Get reward from env
+4. Store trajectory
+
+### Training Phase
+
+1. Compute GRPO advantages: `A_i = R_i - mean(R_group)`
+2. Apply KL penalty: `A' = A + α(log p_base - log p_curr)`
+3. Assemble training datums (tokens, logprobs, advantages)
+4. Forward-backward pass → Tinker GPU
+5. Optimizer step → Tinker GPU
+6. Save checkpoint & create new sampler
+
+### Logging Phase
+
+Metrics tracked:
+- frac_correct (accuracy)
+- frac_correct_format
+- frac_mixed / frac_all_good / frac_all_bad
+- kl_policy_base
+- reward/total
+
+Output: W&B dashboard, metrics.jsonl
 
 ---
 
